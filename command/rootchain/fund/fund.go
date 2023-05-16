@@ -1,0 +1,183 @@
+package fund
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+	"github.com/umbracle/ethgo"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/0xPolygon/polygon-edge/command"
+	"github.com/0xPolygon/polygon-edge/command/polybftsecrets"
+	"github.com/0xPolygon/polygon-edge/command/rootchain/helper"
+	"github.com/0xPolygon/polygon-edge/txrelayer"
+	"github.com/0xPolygon/polygon-edge/types"
+)
+
+var (
+	params fundParams
+)
+
+// GetCommand returns the rootchain fund command
+func GetCommand() *cobra.Command {
+	rootchainFundCmd := &cobra.Command{
+		Use:     "fund",
+		Short:   "Fund validator account with given tokens amount",
+		PreRunE: preRunCommand,
+		Run:     runCommand,
+	}
+
+	setFlags(rootchainFundCmd)
+
+	return rootchainFundCmd
+}
+
+func setFlags(cmd *cobra.Command) {
+	cmd.Flags().StringSliceVar(
+		&params.addresses,
+		addressesFlag,
+		nil,
+		"validator addresses",
+	)
+
+	cmd.Flags().StringSliceVar(
+		&params.amounts,
+		amountsFlag,
+		nil,
+		"token amounts which is funded to validator on a root chain",
+	)
+
+	cmd.Flags().StringVar(
+		&params.jsonRPCAddress,
+		jsonRPCFlag,
+		txrelayer.DefaultRPCAddress,
+		"the rootchain JSON RPC endpoint",
+	)
+
+	cmd.Flags().StringVar(
+		&params.nativeRootTokenAddr,
+		helper.NativeRootTokenFlag,
+		"",
+		helper.NativeRootTokenFlagDesc,
+	)
+
+	cmd.Flags().BoolVar(
+		&params.mintRootToken,
+		mintRootTokenFlag,
+		false,
+		"indicates if root token deployer should mint root tokens to given validators",
+	)
+
+	cmd.Flags().StringVar(
+		&params.deployerPrivateKey,
+		polybftsecrets.PrivateKeyFlag,
+		"",
+		polybftsecrets.PrivateKeyFlagDesc,
+	)
+}
+
+func preRunCommand(_ *cobra.Command, _ []string) error {
+	return params.validateFlags()
+}
+
+func runCommand(cmd *cobra.Command, _ []string) {
+	outputter := command.InitializeOutputter(cmd)
+	defer outputter.WriteOutput()
+
+	txRelayer, err := txrelayer.NewTxRelayer(txrelayer.WithIPAddress(params.jsonRPCAddress))
+	if err != nil {
+		outputter.SetError(fmt.Errorf("failed to initialize tx relayer: %w", err))
+
+		return
+	}
+
+	var (
+		deployerKey   ethgo.Key
+		rootTokenAddr types.Address
+	)
+
+	if params.mintRootToken {
+		deployerKey, err = helper.GetRootchainPrivateKey(params.deployerPrivateKey)
+		if err != nil {
+			outputter.SetError(fmt.Errorf("failed to initialize deployer private key: %w", err))
+
+			return
+		}
+
+		rootTokenAddr = types.StringToAddress(params.nativeRootTokenAddr)
+	}
+
+	results := make([]command.CommandResult, len(params.addresses))
+	g, ctx := errgroup.WithContext(cmd.Context())
+
+	for i := 0; i < len(params.addresses); i++ {
+		i := i
+
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			default:
+				validatorAddr := types.StringToAddress(params.addresses[i])
+				fundAddr := ethgo.Address(validatorAddr)
+				txn := &ethgo.Transaction{
+					To:    &fundAddr,
+					Value: params.amountValues[i],
+				}
+
+				receipt, err := txRelayer.SendTransactionLocal(txn)
+				if err != nil {
+					return fmt.Errorf("failed to send fund validator '%s' transaction: %w", validatorAddr, err)
+				}
+
+				if receipt.Status == uint64(types.ReceiptFailed) {
+					return fmt.Errorf("failed to fund validator '%s'", validatorAddr)
+				}
+
+				if params.mintRootToken {
+					// mint tokens to validator, so he is able to send them
+					mintTxn, err := helper.CreateMintTxn(validatorAddr, rootTokenAddr, params.amountValues[i])
+					if err != nil {
+						return fmt.Errorf("failed to create mint native tokens transaction for validator '%s'. err: %w",
+							validatorAddr, err)
+					}
+
+					receipt, err := txRelayer.SendTransaction(mintTxn, deployerKey)
+					if err != nil {
+						return fmt.Errorf("failed to send mint native tokens transaction to validator '%s'. err: %w", validatorAddr, err)
+					}
+
+					if receipt.Status == uint64(types.ReceiptFailed) {
+						return fmt.Errorf("failed to mint native tokens to validator '%s'", validatorAddr)
+					}
+				}
+
+				results[i] = &result{
+					ValidatorAddr: validatorAddr,
+					TxHash:        types.Hash(receipt.TransactionHash),
+					IsMinted:      params.mintRootToken,
+				}
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		outputter.SetError(err)
+		_, _ = outputter.Write([]byte("[ROOTCHAIN FUND] Successfully funded following accounts\n"))
+
+		for _, result := range results {
+			if result != nil {
+				// In case an error happened, some of the indices may not be populated.
+				// Filter those out.
+				outputter.SetCommandResult(result)
+			}
+		}
+
+		return
+	}
+
+	outputter.SetCommandResult(command.Results(results))
+}
